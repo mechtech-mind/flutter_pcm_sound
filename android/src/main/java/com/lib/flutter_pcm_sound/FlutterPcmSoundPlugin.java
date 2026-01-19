@@ -72,7 +72,7 @@ public class FlutterPcmSoundPlugin implements
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
         mMethodChannel.setMethodCallHandler(null);
-        cleanup();
+        cleanupInternal();
     }
 
     @Override
