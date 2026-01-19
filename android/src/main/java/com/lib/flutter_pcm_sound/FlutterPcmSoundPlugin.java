@@ -278,6 +278,9 @@ public class FlutterPcmSoundPlugin implements
             } catch (InterruptedException ignored) {
             }
         }
+
+        Log.w("PCM", "playback thread exiting");
+
     }
 
             private void cleanup() {
@@ -312,6 +315,9 @@ public class FlutterPcmSoundPlugin implements
 
                 mSamples.clear();
                 mDidSetup = false;
+
+                Log.w("PCM", "cleanup() called | thread=" + playbackThread);
+
             }
 
 
