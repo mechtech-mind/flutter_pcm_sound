@@ -7,7 +7,7 @@ import android.media.AudioTrack;
 import android.media.AudioAttributes;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
+import android.content.Context;
 
 import androidx.annotation.NonNull;
 
@@ -16,7 +16,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.io.StringWriter;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
@@ -27,13 +26,17 @@ import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 
 /**
- * FlutterPcmSoundPlugin implements a "one pedal" PCM sound playback mechanism.
- * Playback starts automatically when samples are fed and stops when no more samples are available.
+ * FlutterPcmSoundPlugin
+ *
+ * MODIFIED FOR VOICE / TELEPHONY USE-CASE:
+ * - Routes audio to earpiece correctly
+ * - Uses VOICE_COMMUNICATION audio attributes
+ * - Works alongside WebRTC / SIP calls
  */
 public class FlutterPcmSoundPlugin implements
-    FlutterPlugin,
-    MethodChannel.MethodCallHandler
-{
+        FlutterPlugin,
+        MethodChannel.MethodCallHandler {
+
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
     private static final int MAX_FRAMES_PER_BUFFER = 200;
 
@@ -52,22 +55,15 @@ public class FlutterPcmSoundPlugin implements
     private long mLastLowBufferFeed = 0;
     private long mLastZeroFeed = 0;
 
-    // Thread-safe queue for storing audio samples
+    // Thread-safe queue for PCM buffers
     private final LinkedBlockingQueue<ByteBuffer> mSamples = new LinkedBlockingQueue<>();
 
-    // Log level enum (kept for potential future use)
-    private enum LogLevel {
-        NONE,
-        ERROR,
-        STANDARD,
-        VERBOSE
-    }
-
-    private LogLevel mLogLevel = LogLevel.VERBOSE;
+    private Context applicationContext;
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
         BinaryMessenger messenger = binding.getBinaryMessenger();
+        applicationContext = binding.getApplicationContext();
         mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
         mMethodChannel.setMethodCallHandler(this);
     }
@@ -80,206 +76,192 @@ public class FlutterPcmSoundPlugin implements
 
     @Override
     @SuppressWarnings("deprecation") // Needed for compatibility with Android < 23
-    public void onMethodCall(@NonNull MethodCall call, @NonNull MethodChannel.Result result) {
+    public void onMethodCall(@NonNull MethodCall call,
+                             @NonNull MethodChannel.Result result) {
         try {
             switch (call.method) {
-                case "setLogLevel": {
-                    result.success(true);
-                    break;
-                }
+
                 case "setup": {
                     int sampleRate = call.argument("sample_rate");
                     mNumChannels = call.argument("num_channels");
 
-                    // Cleanup existing resources if any
-                    if (mAudioTrack != null) {
-                        cleanup();
-                    }
+                    // Cleanup any previous instance
+                    cleanup();
 
-                    int channelConfig = (mNumChannels == 2) ?
-                        AudioFormat.CHANNEL_OUT_STEREO :
-                        AudioFormat.CHANNEL_OUT_MONO;
+                    // ===============================
+                    // IMPORTANT: TELEPHONY AUDIO MODE
+                    // ===============================
+                    //
+                    // Without MODE_IN_COMMUNICATION,
+                    // Android may still route VOICE audio to speaker.
+                    //
+                    AudioManager audioManager =
+                            (AudioManager) applicationContext.getSystemService(Context.AUDIO_SERVICE);
+                    audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
+                    audioManager.setSpeakerphoneOn(false);
+
+                    int channelConfig = (mNumChannels == 2)
+                            ? AudioFormat.CHANNEL_OUT_STEREO
+                            : AudioFormat.CHANNEL_OUT_MONO;
 
                     mMinBufferSize = AudioTrack.getMinBufferSize(
-                        sampleRate, channelConfig, AudioFormat.ENCODING_PCM_16BIT);
+                            sampleRate,
+                            channelConfig,
+                            AudioFormat.ENCODING_PCM_16BIT
+                    );
 
-                    if (mMinBufferSize == AudioTrack.ERROR || mMinBufferSize == AudioTrack.ERROR_BAD_VALUE) {
-                        result.error("AudioTrackError", "Invalid buffer size.", null);
+                    if (mMinBufferSize <= 0) {
+                        result.error("AudioTrackError", "Invalid buffer size", null);
                         return;
                     }
 
-                    if (Build.VERSION.SDK_INT >= 23) { // Android 6 (Marshmallow) and above
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                        // =========================================================
+                        // CRITICAL FIX:
+                        // Use VOICE_COMMUNICATION instead of MEDIA
+                        // This allows routing to the EARPIECE
+                        // =========================================================
                         mAudioTrack = new AudioTrack.Builder()
-                            .setAudioAttributes(new AudioAttributes.Builder()
-                                    .setUsage(AudioAttributes.USAGE_MEDIA)
-                                    .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                                    .build())
-                            .setAudioFormat(new AudioFormat.Builder()
-                                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                    .setSampleRate(sampleRate)
-                                    .setChannelMask(channelConfig)
-                                    .build())
-                            .setBufferSizeInBytes(mMinBufferSize)
-                            .setTransferMode(AudioTrack.MODE_STREAM)
-                            .build();
+                                .setAudioAttributes(
+                                        new AudioAttributes.Builder()
+                                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                                .build()
+                                )
+                                .setAudioFormat(
+                                        new AudioFormat.Builder()
+                                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                                .setSampleRate(sampleRate)
+                                                .setChannelMask(channelConfig)
+                                                .build()
+                                )
+                                .setBufferSizeInBytes(mMinBufferSize)
+                                .setTransferMode(AudioTrack.MODE_STREAM)
+                                .build();
                     } else {
+                        // =========================================================
+                        // LEGACY DEVICES (< API 23)
+                        // STREAM_VOICE_CALL ensures earpiece routing
+                        // =========================================================
                         mAudioTrack = new AudioTrack(
-                            AudioManager.STREAM_MUSIC,
-                            sampleRate,
-                            channelConfig,
-                            AudioFormat.ENCODING_PCM_16BIT,
-                            mMinBufferSize,
-                            AudioTrack.MODE_STREAM);
+                                AudioManager.STREAM_VOICE_CALL,
+                                sampleRate,
+                                channelConfig,
+                                AudioFormat.ENCODING_PCM_16BIT,
+                                mMinBufferSize,
+                                AudioTrack.MODE_STREAM
+                        );
                     }
 
                     if (mAudioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
-                        result.error("AudioTrackError", "AudioTrack initialization failed.", null);
-                        mAudioTrack.release();
-                        mAudioTrack = null;
+                        result.error("AudioTrackError", "AudioTrack init failed", null);
                         return;
                     }
 
-                    // reset
                     mSamples.clear();
                     mShouldCleanup = false;
 
-                    // start playback thread
                     playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
                     playbackThread.setPriority(Thread.MAX_PRIORITY);
                     playbackThread.start();
 
                     mDidSetup = true;
-
                     result.success(true);
                     break;
                 }
-                case "feed": {
 
-                    // check setup (to match iOS behavior)
-                    if (mDidSetup == false) {
-                        result.error("Setup", "must call setup first", null);
+                case "feed": {
+                    if (!mDidSetup) {
+                        result.error("Setup", "Must call setup() first", null);
                         return;
                     }
 
                     byte[] buffer = call.argument("buffer");
-
-                    // Split for better performance
                     List<ByteBuffer> chunks = split(buffer, MAX_FRAMES_PER_BUFFER);
 
-                    // Push samples
                     synchronized (mSamples) {
                         for (ByteBuffer chunk : chunks) {
                             mSamples.add(chunk);
                         }
-                        mTotalFeeds += 1;
+                        mTotalFeeds++;
                     }
 
                     result.success(true);
                     break;
                 }
-                case "setFeedThreshold": {
-                    long feedThreshold = ((Number) call.argument("feed_threshold")).longValue();
 
+                case "setFeedThreshold": {
+                    long feedThreshold =
+                            ((Number) call.argument("feed_threshold")).longValue();
                     synchronized (mSamples) {
                         mFeedThreshold = feedThreshold;
                     }
-
                     result.success(true);
                     break;
                 }
+
                 case "release": {
                     cleanup();
                     result.success(true);
                     break;
                 }
+
                 default:
                     result.notImplemented();
-                    break;
             }
-
 
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
-            PrintWriter pw = new PrintWriter(sw);
-            e.printStackTrace(pw);
-            String stackTrace = sw.toString();
-            result.error("androidException", e.toString(), stackTrace);
-            return;
+            e.printStackTrace(new PrintWriter(sw));
+            result.error("androidException", e.toString(), sw.toString());
         }
     }
 
     /**
-     * Cleans up resources by stopping the playback thread and releasing AudioTrack.
-     */
-    private void cleanup() {
-        // stop playback thread
-        if (playbackThread != null) {
-            mShouldCleanup = true;
-            playbackThread.interrupt();
-            try {
-                playbackThread.join();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
-            playbackThread = null;
-            mDidSetup = false;
-        }
-    }
-
-    /**
-     * Invokes the 'OnFeedSamples' callback with the number of remaining frames.
-     */
-    private void invokeFeedCallback(long remainingFrames) {
-        Map<String, Object> response = new HashMap<>();
-        response.put("remaining_frames", remainingFrames);
-        mMethodChannel.invokeMethod("OnFeedSamples", response);
-    }
-
-    /**
-     * The main loop of the playback thread.
+     * Playback loop running on high-priority audio thread
      */
     private void playbackThreadLoop() {
-        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO);
+        android.os.Process.setThreadPriority(
+                android.os.Process.THREAD_PRIORITY_AUDIO
+        );
 
         mAudioTrack.play();
 
         while (!mShouldCleanup) {
-            ByteBuffer data = null;
             try {
-                // blocks indefinitely until new data
-                data = mSamples.take();
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                continue;
-            }
+                ByteBuffer data = mSamples.take();
+                mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
 
-            // write
-            mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+                long remainingFrames;
+                long totalFeeds;
+                long feedThreshold;
 
-            long remainingFrames;
-            long totalFeeds;
-            long feedThreshold;
-
-            // grab shared data
-            synchronized (mSamples) {
-                long totalBytes = 0;
-                for (ByteBuffer sampleBuffer : mSamples) {
-                    totalBytes += sampleBuffer.remaining();
+                synchronized (mSamples) {
+                    long totalBytes = 0;
+                    for (ByteBuffer b : mSamples) {
+                        totalBytes += b.remaining();
+                    }
+                    remainingFrames = totalBytes / (2 * mNumChannels);
+                    totalFeeds = mTotalFeeds;
+                    feedThreshold = mFeedThreshold;
                 }
-                remainingFrames = totalBytes / (2 * mNumChannels);
-                totalFeeds = mTotalFeeds;
-                feedThreshold = mFeedThreshold;
-            }
 
-            // check for events
-            boolean isLowBufferEvent = (remainingFrames <= feedThreshold) && (mLastLowBufferFeed != totalFeeds);
-            boolean isZeroCrossingEvent = (remainingFrames == 0) && (mLastZeroFeed != totalFeeds);
+                boolean low =
+                        remainingFrames <= feedThreshold &&
+                        mLastLowBufferFeed != totalFeeds;
 
-            // send events
-            if (isLowBufferEvent || isZeroCrossingEvent) {
-                if (isLowBufferEvent) {mLastLowBufferFeed = totalFeeds;}
-                if (isZeroCrossingEvent) {mLastZeroFeed = totalFeeds;}
-                mainThreadHandler.post(() -> invokeFeedCallback(remainingFrames));
+                boolean zero =
+                        remainingFrames == 0 &&
+                        mLastZeroFeed != totalFeeds;
+
+                if (low || zero) {
+                    if (low) mLastLowBufferFeed = totalFeeds;
+                    if (zero) mLastZeroFeed = totalFeeds;
+                    long rf = remainingFrames;
+                    mainThreadHandler.post(() -> invokeFeedCallback(rf));
+                }
+
+            } catch (InterruptedException ignored) {
             }
         }
 
@@ -289,16 +271,29 @@ public class FlutterPcmSoundPlugin implements
         mAudioTrack = null;
     }
 
+    private void cleanup() {
+        mShouldCleanup = true;
+        if (playbackThread != null) {
+            playbackThread.interrupt();
+            playbackThread = null;
+        }
+        mDidSetup = false;
+    }
+
+    private void invokeFeedCallback(long remainingFrames) {
+        Map<String, Object> map = new HashMap<>();
+        map.put("remaining_frames", remainingFrames);
+        mMethodChannel.invokeMethod("OnFeedSamples", map);
+    }
 
     private List<ByteBuffer> split(byte[] buffer, int maxSize) {
-        List<ByteBuffer> chunks = new ArrayList<>();
+        List<ByteBuffer> out = new ArrayList<>();
         int offset = 0;
         while (offset < buffer.length) {
-            int length = Math.min(buffer.length - offset, maxSize);
-            ByteBuffer b = ByteBuffer.wrap(buffer, offset, length);
-            chunks.add(b);
-            offset += length;
+            int len = Math.min(buffer.length - offset, maxSize);
+            out.add(ByteBuffer.wrap(buffer, offset, len));
+            offset += len;
         }
-        return chunks;
+        return out;
     }
 }
