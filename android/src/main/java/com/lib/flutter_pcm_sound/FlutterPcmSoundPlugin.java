@@ -5,8 +5,6 @@ import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
 import android.media.AudioAttributes;
-import android.media.AudioDeviceInfo;
-import android.media.AudioDeviceCallback;
 import android.os.Handler;
 import android.os.Looper;
 import android.content.Context;
@@ -19,200 +17,177 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.ArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.TimeUnit;
 import java.io.StringWriter;
 import java.io.PrintWriter;
 import java.nio.ByteBuffer;
 
 import io.flutter.embedding.engine.plugins.FlutterPlugin;
+import io.flutter.plugin.common.BinaryMessenger;
 import io.flutter.plugin.common.MethodCall;
 import io.flutter.plugin.common.MethodChannel;
 
 /**
  * FlutterPcmSoundPlugin
  *
- * FINAL FIX:
- * - Handles WebRTC route changes (earpiece/speaker/Bluetooth)
- * - Rebinds AudioTrack dynamically
- * - Prevents silent second call
- * - Does NOT fight WebRTC AudioManager ownership
+ * MODIFIED FOR VOICE / TELEPHONY USE-CASE:
+ * - Routes audio to earpiece correctly
+ * - Uses VOICE_COMMUNICATION audio attributes
+ * - Works alongside WebRTC / SIP calls
  */
-public class FlutterPcmSoundPlugin
-        implements FlutterPlugin, MethodChannel.MethodCallHandler {
+public class FlutterPcmSoundPlugin implements
+        FlutterPlugin,
+        MethodChannel.MethodCallHandler {
 
     private static final String CHANNEL_NAME = "flutter_pcm_sound/methods";
     private static final int MAX_FRAMES_PER_BUFFER = 200;
 
-    private MethodChannel channel;
-    private Context context;
-    private AudioManager audioManager;
-
-    private AudioTrack audioTrack;
+    private MethodChannel mMethodChannel;
+    private Handler mainThreadHandler = new Handler(Looper.getMainLooper());
     private Thread playbackThread;
-    private volatile boolean shouldStop = false;
+    private volatile boolean mShouldCleanup = false;
 
-    private int numChannels;
-    private boolean didSetup = false;
+    private AudioTrack mAudioTrack;
+    private int mNumChannels;
+    private int mMinBufferSize;
+    private boolean mDidSetup = false;
 
-    private long feedThreshold = 8000;
-    private long totalFeeds = 0;
-    private long lastLowFeed = 0;
-    private long lastZeroFeed = 0;
+    private long mFeedThreshold = 8000;
+    private long mTotalFeeds = 0;
+    private long mLastLowBufferFeed = 0;
+    private long mLastZeroFeed = 0;
 
-    private final LinkedBlockingQueue<ByteBuffer> queue =
-            new LinkedBlockingQueue<>();
+    // Thread-safe queue for PCM buffers
+    private final LinkedBlockingQueue<ByteBuffer> mSamples = new LinkedBlockingQueue<>();
 
-    private AudioDeviceCallback deviceCallback;
-
-    private final Handler mainHandler =
-            new Handler(Looper.getMainLooper());
-
-    // ─────────────────────────────────────────────
+    private Context applicationContext;
 
     @Override
     public void onAttachedToEngine(@NonNull FlutterPluginBinding binding) {
-        context = binding.getApplicationContext();
-        audioManager =
-                (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
-        channel = new MethodChannel(
-                binding.getBinaryMessenger(),
-                CHANNEL_NAME
-        );
-        channel.setMethodCallHandler(this);
+        BinaryMessenger messenger = binding.getBinaryMessenger();
+        applicationContext = binding.getApplicationContext();
+        mMethodChannel = new MethodChannel(messenger, CHANNEL_NAME);
+        mMethodChannel.setMethodCallHandler(this);
     }
 
     @Override
     public void onDetachedFromEngine(@NonNull FlutterPluginBinding binding) {
-        channel.setMethodCallHandler(null);
-        cleanup();
+        mMethodChannel.setMethodCallHandler(null);
+        cleanupInternal();
     }
 
-    // ─────────────────────────────────────────────
-
     @Override
-    public void onMethodCall(
-            @NonNull MethodCall call,
-            @NonNull MethodChannel.Result result
-    ) {
+    @SuppressWarnings("deprecation") // Needed for compatibility with Android < 23
+    public void onMethodCall(@NonNull MethodCall call,
+                             @NonNull MethodChannel.Result result) {
         try {
             switch (call.method) {
 
-                case "setup": {
-                    int sampleRate = call.argument("sample_rate");
-                    numChannels = call.argument("num_channels");
+case "setup": {
+    int sampleRate = call.argument("sample_rate");
+    mNumChannels = call.argument("num_channels");
 
-                    if (didSetup) cleanup();
+    // Only cleanup if we were actually running
+    if (mDidSetup) {
+        cleanupInternal();
+    }
 
-                    totalFeeds = 0;
-                    lastLowFeed = 0;
-                    lastZeroFeed = 0;
+    mTotalFeeds = 0;
+    mLastLowBufferFeed = 0;
+    mLastZeroFeed = 0;
 
-                    int channelMask =
-                            (numChannels == 2)
-                                    ? AudioFormat.CHANNEL_OUT_STEREO
-                                    : AudioFormat.CHANNEL_OUT_MONO;
+    int channelConfig = (mNumChannels == 2)
+            ? AudioFormat.CHANNEL_OUT_STEREO
+            : AudioFormat.CHANNEL_OUT_MONO;
 
-                    int minBuffer =
-                            AudioTrack.getMinBufferSize(
-                                    sampleRate,
-                                    channelMask,
-                                    AudioFormat.ENCODING_PCM_16BIT
-                            );
+    mMinBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            channelConfig,
+            AudioFormat.ENCODING_PCM_16BIT
+    );
 
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        audioTrack =
-                                new AudioTrack.Builder()
-                                        .setAudioAttributes(
-                                                new AudioAttributes.Builder()
-                                                        .setUsage(
-                                                                AudioAttributes.USAGE_VOICE_COMMUNICATION
-                                                        )
-                                                        .setContentType(
-                                                                AudioAttributes.CONTENT_TYPE_SPEECH
-                                                        )
-                                                        .build()
-                                        )
-                                        .setAudioFormat(
-                                                new AudioFormat.Builder()
-                                                        .setSampleRate(sampleRate)
-                                                        .setEncoding(
-                                                                AudioFormat.ENCODING_PCM_16BIT
-                                                        )
-                                                        .setChannelMask(channelMask)
-                                                        .build()
-                                        )
-                                        .setBufferSizeInBytes(minBuffer)
-                                        .setTransferMode(AudioTrack.MODE_STREAM)
-                                        .build();
-                    } else {
-                        audioTrack =
-                                new AudioTrack(
-                                        AudioManager.STREAM_VOICE_CALL,
-                                        sampleRate,
-                                        channelMask,
-                                        AudioFormat.ENCODING_PCM_16BIT,
-                                        minBuffer,
-                                        AudioTrack.MODE_STREAM
-                                );
-                    }
+    if (mMinBufferSize <= 0) {
+        result.error("AudioTrackError", "Invalid buffer size", null);
+        return;
+    }
 
-                    if (audioTrack.getState()
-                            != AudioTrack.STATE_INITIALIZED) {
-                        result.error(
-                                "PCM",
-                                "AudioTrack init failed",
-                                null
-                        );
-                        return;
-                    }
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        mAudioTrack = new AudioTrack.Builder()
+                .setAudioAttributes(
+                        new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                )
+                .setAudioFormat(
+                        new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(channelConfig)
+                                .build()
+                )
+                .setBufferSizeInBytes(mMinBufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
+    } else {
+        mAudioTrack = new AudioTrack(
+                AudioManager.STREAM_VOICE_CALL,
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT,
+                mMinBufferSize,
+                AudioTrack.MODE_STREAM
+        );
+    }
 
-                    queue.clear();
-                    shouldStop = false;
+    if (mAudioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+        result.error("AudioTrackError", "AudioTrack init failed", null);
+        return;
+    }
 
-                    registerDeviceCallback();
-                    rebindAudioRoute();
+    mSamples.clear();
+    mShouldCleanup = false;
 
-                    playbackThread =
-                            new Thread(
-                                    this::playbackLoop,
-                                    "PCMPlaybackThread"
-                            );
-                    playbackThread.start();
+    playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
+    playbackThread.start();
 
-                    didSetup = true;
-                    result.success(true);
-                    break;
-                }
+    mDidSetup = true;
+    result.success(true);
+    break;
+}
+
 
                 case "feed": {
-                    if (!didSetup) {
-                        result.error(
-                                "PCM",
-                                "setup() not called",
-                                null
-                        );
+                    if (!mDidSetup) {
+                        result.error("Setup", "Must call setup() first", null);
                         return;
                     }
 
-                    byte[] buf = call.argument("buffer");
-                    for (ByteBuffer b : split(buf, MAX_FRAMES_PER_BUFFER)) {
-                        queue.offer(b);
+                    byte[] buffer = call.argument("buffer");
+                    List<ByteBuffer> chunks = split(buffer, MAX_FRAMES_PER_BUFFER);
+
+                    synchronized (mSamples) {
+                        for (ByteBuffer chunk : chunks) {
+                            mSamples.add(chunk);
+                        }
+                        mTotalFeeds++;
                     }
-                    totalFeeds++;
+
                     result.success(true);
                     break;
                 }
 
                 case "setFeedThreshold": {
-                    feedThreshold =
-                            ((Number) call.argument("feed_threshold"))
-                                    .longValue();
+                    long feedThreshold =
+                            ((Number) call.argument("feed_threshold")).longValue();
+                    synchronized (mSamples) {
+                        mFeedThreshold = feedThreshold;
+                    }
                     result.success(true);
                     break;
                 }
 
                 case "release": {
-                    cleanup();
+                    cleanupInternal();
                     result.success(true);
                     break;
                 }
@@ -220,185 +195,125 @@ public class FlutterPcmSoundPlugin
                 default:
                     result.notImplemented();
             }
+
         } catch (Exception e) {
             StringWriter sw = new StringWriter();
             e.printStackTrace(new PrintWriter(sw));
-            result.error("PCM", e.toString(), sw.toString());
+            result.error("androidException", e.toString(), sw.toString());
         }
     }
 
-    // ─────────────────────────────────────────────
-
-    private void playbackLoop() {
+    /**
+     * Playback loop running on high-priority audio thread
+     */
+    private void playbackThreadLoop() {
         android.os.Process.setThreadPriority(
                 android.os.Process.THREAD_PRIORITY_AUDIO
         );
 
-        audioTrack.play();
+        mAudioTrack.play();
 
-        while (!shouldStop) {
+        while (!mShouldCleanup) {
             try {
-                ByteBuffer data =
-                        queue.poll(200, TimeUnit.MILLISECONDS);
-                if (data == null || data.remaining() == 0) continue;
+                        ByteBuffer data = mSamples.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (data == null || data.remaining() == 0) {
+                            continue;
+                        }
 
-                audioTrack.write(
-                        data,
-                        data.remaining(),
-                        AudioTrack.WRITE_BLOCKING
-                );
+                        mAudioTrack.write(
+                                data,
+                                data.remaining(),
+                                AudioTrack.WRITE_BLOCKING
+                        );
 
-                long remaining =
-                        queue.stream()
-                                .mapToLong(ByteBuffer::remaining)
-                                .sum() / (2 * numChannels);
+
+                long remainingFrames;
+                long totalFeeds;
+                long feedThreshold;
+
+                synchronized (mSamples) {
+                    long totalBytes = 0;
+                    for (ByteBuffer b : mSamples) {
+                        totalBytes += b.remaining();
+                    }
+                    remainingFrames = totalBytes / (2 * mNumChannels);
+                    totalFeeds = mTotalFeeds;
+                    feedThreshold = mFeedThreshold;
+                }
 
                 boolean low =
-                        remaining <= feedThreshold
-                                && lastLowFeed != totalFeeds;
+                        remainingFrames <= feedThreshold &&
+                        mLastLowBufferFeed != totalFeeds;
+
                 boolean zero =
-                        remaining == 0
-                                && lastZeroFeed != totalFeeds;
+                        remainingFrames == 0 &&
+                        mLastZeroFeed != totalFeeds;
 
                 if (low || zero) {
-                    if (low) lastLowFeed = totalFeeds;
-                    if (zero) lastZeroFeed = totalFeeds;
-                    long rf = remaining;
-                    mainHandler.post(
-                            () -> invokeFeedCallback(rf)
-                    );
+                    if (low) mLastLowBufferFeed = totalFeeds;
+                    if (zero) mLastZeroFeed = totalFeeds;
+                    long rf = remainingFrames;
+                    mainThreadHandler.post(() -> invokeFeedCallback(rf));
                 }
 
             } catch (InterruptedException ignored) {
             }
         }
 
-        Log.w("PCM", "Playback thread exited");
+        Log.w("PCM", "playback thread exiting");
+
     }
 
-    // ─────────────────────────────────────────────
+private void cleanupInternal() {
+    mShouldCleanup = true;
 
-    private void registerDeviceCallback() {
-        if (Build.VERSION.SDK_INT < 23) return;
+    mSamples.offer(ByteBuffer.allocate(0));
 
-        deviceCallback =
-                new AudioDeviceCallback() {
-                    @Override
-                    public void onAudioDevicesAdded(
-                            AudioDeviceInfo[] added
-                    ) {
-                        logDevices("ADDED", added);
-                        rebindAudioRoute();
-                    }
-
-                    @Override
-                    public void onAudioDevicesRemoved(
-                            AudioDeviceInfo[] removed
-                    ) {
-                        logDevices("REMOVED", removed);
-                        rebindAudioRoute();
-                    }
-                };
-
-        audioManager.registerAudioDeviceCallback(
-                deviceCallback,
-                mainHandler
-        );
+    if (playbackThread != null) {
+        playbackThread.interrupt();
+        try {
+            playbackThread.join(500);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        playbackThread = null;
     }
 
-    private void rebindAudioRoute() {
-        if (Build.VERSION.SDK_INT < 23 || audioTrack == null) return;
-
-        for (AudioDeviceInfo d :
-                audioManager.getDevices(
-                        AudioManager.GET_DEVICES_OUTPUTS
-                )) {
-            if (d.getType()
-                    == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
-                    || d.getType()
-                    == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
-                    || d.getType()
-                    == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
-
-                boolean ok =
-                        audioTrack.setPreferredDevice(d);
-                Log.w(
-                        "PCM-ROUTE",
-                        "Rebind → " + d.getProductName()
-                                + " success=" + ok
-                );
-                return;
-            }
-        }
+    if (mAudioTrack != null) {
+        try {
+            mAudioTrack.pause();
+            mAudioTrack.flush();
+            mAudioTrack.stop();
+        } catch (Exception ignored) {}
+        mAudioTrack.release();
+        mAudioTrack = null;
     }
 
-    private void logDevices(String tag, AudioDeviceInfo[] devices) {
-        for (AudioDeviceInfo d : devices) {
-            Log.w(
-                    "PCM-ROUTE",
-                    tag + " " + d.getProductName()
-                            + " type=" + d.getType()
-            );
-        }
-    }
+    // ❌ DO NOT TOUCH AudioManager MODE
+    // WebRTC/SIP owns it
 
-    // ─────────────────────────────────────────────
+    mSamples.clear();
+    mDidSetup = false;
 
-    private void cleanup() {
-        shouldStop = true;
+    Log.w("PCM", "cleanup completed");
+}
 
-        queue.offer(ByteBuffer.allocate(0));
 
-        if (playbackThread != null) {
-            playbackThread.interrupt();
-            try {
-                playbackThread.join(300);
-            } catch (InterruptedException ignored) {}
-            playbackThread = null;
-        }
 
-        if (audioTrack != null) {
-            try {
-                audioTrack.pause();
-                audioTrack.flush();
-                audioTrack.stop();
-            } catch (Exception ignored) {}
-            audioTrack.release();
-            audioTrack = null;
-        }
 
-        if (deviceCallback != null
-                && Build.VERSION.SDK_INT >= 23) {
-            audioManager.unregisterAudioDeviceCallback(
-                    deviceCallback
-            );
-            deviceCallback = null;
-        }
-
-        queue.clear();
-        didSetup = false;
-
-        Log.w("PCM", "Cleanup completed");
-    }
-
-    // ─────────────────────────────────────────────
-
-    private void invokeFeedCallback(long frames) {
+    private void invokeFeedCallback(long remainingFrames) {
         Map<String, Object> map = new HashMap<>();
-        map.put("remaining_frames", frames);
-        channel.invokeMethod("OnFeedSamples", map);
+        map.put("remaining_frames", remainingFrames);
+        mMethodChannel.invokeMethod("OnFeedSamples", map);
     }
 
-    private List<ByteBuffer> split(byte[] buf, int max) {
+    private List<ByteBuffer> split(byte[] buffer, int maxSize) {
         List<ByteBuffer> out = new ArrayList<>();
-        for (int i = 0; i < buf.length; i += max) {
-            out.add(
-                    ByteBuffer.wrap(
-                            buf,
-                            i,
-                            Math.min(max, buf.length - i)
-                    )
-            );
+        int offset = 0;
+        while (offset < buffer.length) {
+            int len = Math.min(buffer.length - offset, maxSize);
+            out.add(ByteBuffer.wrap(buffer, offset, len));
+            offset += len;
         }
         return out;
     }
