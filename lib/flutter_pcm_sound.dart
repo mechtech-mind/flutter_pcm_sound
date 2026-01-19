@@ -27,11 +27,22 @@ class FlutterPcmSound {
 
   static bool _needsStart = true;
 
+  static const int _maxPcmLogs = 10;
+static int _pcmLogCount = 0;
+
+
   /// set log level
   static Future<void> setLogLevel(LogLevel level) async {
     _logLevel = level;
     return await _invokeMethod('setLogLevel', {'log_level': level.index});
   }
+
+  static void _pcmPrint(String message) {
+  if (_pcmLogCount >= _maxPcmLogs) return;
+  _pcmLogCount++;
+  print(message);
+}
+
 
   /// setup audio
   /// 'avAudioCategory' is for iOS only,
@@ -77,6 +88,7 @@ class FlutterPcmSound {
   ///   * if needed, invokes your feed callback to start playback
   ///   * returns true if your callback was invoked
   static bool start() {
+    _pcmLogCount = 0;
     if (_needsStart && onFeedSamplesCallback != null) {
       onFeedSamplesCallback!(0);
       return true;
@@ -106,7 +118,7 @@ class FlutterPcmSound {
       } else if (arguments != null) {
         args = arguments.toString();
       }
-      if(_logLevel.index < 10){print("[PCM] invoke: $method $args");};
+     _pcmPrint("[PCM] invoke: $method $args");
     }
     return await _channel.invokeMethod(method, arguments);
   }
@@ -115,7 +127,7 @@ class FlutterPcmSound {
     if (_logLevel.index >= LogLevel.standard.index) {
       String func = '[[ ${call.method} ]]';
       String args = call.arguments.toString();
-      if(_logLevel.index < 10){print("[PCM] $func $args");};
+      _pcmPrint("[PCM] $func $args");
     }
     switch (call.method) {
       case 'OnFeedSamples':
