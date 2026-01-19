@@ -86,9 +86,12 @@ class FlutterPcmSound {
   }
 
   /// release all audio resources
-  static Future<void> release() async {
-    return await _invokeMethod('release');
-  }
+    static Future<void> release() async {
+      _needsStart = true;          // 🔥 FIX
+      onFeedSamplesCallback = null; // optional but correct
+      return await _invokeMethod('release');
+    }
+
 
   static Future<T?> _invokeMethod<T>(String method, [dynamic arguments]) async {
     if (_logLevel.index >= LogLevel.standard.index) {
