@@ -82,99 +82,79 @@ public class FlutterPcmSoundPlugin implements
         try {
             switch (call.method) {
 
-                case "setup": {
-                    int sampleRate = call.argument("sample_rate");
-                    mNumChannels = call.argument("num_channels");
+case "setup": {
+    int sampleRate = call.argument("sample_rate");
+    mNumChannels = call.argument("num_channels");
 
-                    // Cleanup any previous instance
-                    cleanup();
+    // Only cleanup if we were actually running
+    if (mDidSetup) {
+        cleanupInternal();
+    }
 
-                    mTotalFeeds = 0;
-                    mLastLowBufferFeed = 0;
-                    mLastZeroFeed = 0;
+    mTotalFeeds = 0;
+    mLastLowBufferFeed = 0;
+    mLastZeroFeed = 0;
 
+    int channelConfig = (mNumChannels == 2)
+            ? AudioFormat.CHANNEL_OUT_STEREO
+            : AudioFormat.CHANNEL_OUT_MONO;
 
-                    // ===============================
-                    // IMPORTANT: TELEPHONY AUDIO MODE
-                    // ===============================
-                    //
-                    // Without MODE_IN_COMMUNICATION,
-                    // Android may still route VOICE audio to speaker.
-                    //
-                    AudioManager audioManager =
-                            (AudioManager) applicationContext.getSystemService(Context.AUDIO_SERVICE);
-                    audioManager.setMode(AudioManager.MODE_IN_COMMUNICATION);
-                    audioManager.setSpeakerphoneOn(false);
+    mMinBufferSize = AudioTrack.getMinBufferSize(
+            sampleRate,
+            channelConfig,
+            AudioFormat.ENCODING_PCM_16BIT
+    );
 
-                    int channelConfig = (mNumChannels == 2)
-                            ? AudioFormat.CHANNEL_OUT_STEREO
-                            : AudioFormat.CHANNEL_OUT_MONO;
+    if (mMinBufferSize <= 0) {
+        result.error("AudioTrackError", "Invalid buffer size", null);
+        return;
+    }
 
-                    mMinBufferSize = AudioTrack.getMinBufferSize(
-                            sampleRate,
-                            channelConfig,
-                            AudioFormat.ENCODING_PCM_16BIT
-                    );
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+        mAudioTrack = new AudioTrack.Builder()
+                .setAudioAttributes(
+                        new AudioAttributes.Builder()
+                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                                .build()
+                )
+                .setAudioFormat(
+                        new AudioFormat.Builder()
+                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                .setSampleRate(sampleRate)
+                                .setChannelMask(channelConfig)
+                                .build()
+                )
+                .setBufferSizeInBytes(mMinBufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build();
+    } else {
+        mAudioTrack = new AudioTrack(
+                AudioManager.STREAM_VOICE_CALL,
+                sampleRate,
+                channelConfig,
+                AudioFormat.ENCODING_PCM_16BIT,
+                mMinBufferSize,
+                AudioTrack.MODE_STREAM
+        );
+    }
 
-                    if (mMinBufferSize <= 0) {
-                        result.error("AudioTrackError", "Invalid buffer size", null);
-                        return;
-                    }
+    if (mAudioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
+        result.error("AudioTrackError", "AudioTrack init failed", null);
+        return;
+    }
 
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                        // =========================================================
-                        // CRITICAL FIX:
-                        // Use VOICE_COMMUNICATION instead of MEDIA
-                        // This allows routing to the EARPIECE
-                        // =========================================================
-                        mAudioTrack = new AudioTrack.Builder()
-                                .setAudioAttributes(
-                                        new AudioAttributes.Builder()
-                                                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
-                                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                                .build()
-                                )
-                                .setAudioFormat(
-                                        new AudioFormat.Builder()
-                                                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                                                .setSampleRate(sampleRate)
-                                                .setChannelMask(channelConfig)
-                                                .build()
-                                )
-                                .setBufferSizeInBytes(mMinBufferSize)
-                                .setTransferMode(AudioTrack.MODE_STREAM)
-                                .build();
-                    } else {
-                        // =========================================================
-                        // LEGACY DEVICES (< API 23)
-                        // STREAM_VOICE_CALL ensures earpiece routing
-                        // =========================================================
-                        mAudioTrack = new AudioTrack(
-                                AudioManager.STREAM_VOICE_CALL,
-                                sampleRate,
-                                channelConfig,
-                                AudioFormat.ENCODING_PCM_16BIT,
-                                mMinBufferSize,
-                                AudioTrack.MODE_STREAM
-                        );
-                    }
+    mSamples.clear();
+    mShouldCleanup = false;
 
-                    if (mAudioTrack.getState() != AudioTrack.STATE_INITIALIZED) {
-                        result.error("AudioTrackError", "AudioTrack init failed", null);
-                        return;
-                    }
+    playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
+    playbackThread.start();
 
-                    mSamples.clear();
-                    mShouldCleanup = false;
+    mDidSetup = true;
+    result.success(true);
+    break;
+}
 
-                    playbackThread = new Thread(this::playbackThreadLoop, "PCMPlaybackThread");
-                    playbackThread.setPriority(Thread.MAX_PRIORITY);
-                    playbackThread.start();
-
-                    mDidSetup = true;
-                    result.success(true);
-                    break;
-                }
 
                 case "feed": {
                     if (!mDidSetup) {
@@ -207,7 +187,7 @@ public class FlutterPcmSoundPlugin implements
                 }
 
                 case "release": {
-                    cleanup();
+                    cleanupInternal();
                     result.success(true);
                     break;
                 }
@@ -284,42 +264,40 @@ public class FlutterPcmSoundPlugin implements
 
     }
 
-            private void cleanup() {
-                mShouldCleanup = true;
+private void cleanupInternal() {
+    mShouldCleanup = true;
 
-                // unblock queue
-                mSamples.offer(ByteBuffer.allocate(0));
+    mSamples.offer(ByteBuffer.allocate(0));
 
-                if (playbackThread != null) {
-                    playbackThread.interrupt();
-                    try {
-                        playbackThread.join(500);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                    }
-                    playbackThread = null;
-                }
+    if (playbackThread != null) {
+        playbackThread.interrupt();
+        try {
+            playbackThread.join(500);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        playbackThread = null;
+    }
 
-                if (mAudioTrack != null) {
-                    try {
-                        mAudioTrack.pause();
-                        mAudioTrack.flush();
-                        mAudioTrack.stop();
-                    } catch (Exception ignored) {}
-                    mAudioTrack.release();
-                    mAudioTrack = null;
-                }
+    if (mAudioTrack != null) {
+        try {
+            mAudioTrack.pause();
+            mAudioTrack.flush();
+            mAudioTrack.stop();
+        } catch (Exception ignored) {}
+        mAudioTrack.release();
+        mAudioTrack = null;
+    }
 
-                AudioManager audioManager =
-                        (AudioManager) applicationContext.getSystemService(Context.AUDIO_SERVICE);
-                audioManager.setMode(AudioManager.MODE_NORMAL);
+    // ❌ DO NOT TOUCH AudioManager MODE
+    // WebRTC/SIP owns it
 
-                mSamples.clear();
-                mDidSetup = false;
+    mSamples.clear();
+    mDidSetup = false;
 
-                Log.w("PCM", "cleanup() called | thread=" + playbackThread);
+    Log.w("PCM", "cleanup completed");
+}
 
-            }
 
 
 
