@@ -88,6 +88,11 @@ public class FlutterPcmSoundPlugin implements
                     // Cleanup any previous instance
                     cleanup();
 
+                    mTotalFeeds = 0;
+                    mLastLowBufferFeed = 0;
+                    mLastZeroFeed = 0;
+
+
                     // ===============================
                     // IMPORTANT: TELEPHONY AUDIO MODE
                     // ===============================
@@ -229,8 +234,17 @@ public class FlutterPcmSoundPlugin implements
 
         while (!mShouldCleanup) {
             try {
-                ByteBuffer data = mSamples.take();
-                mAudioTrack.write(data, data.remaining(), AudioTrack.WRITE_BLOCKING);
+                        ByteBuffer data = mSamples.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (data == null || data.remaining() == 0) {
+                            continue;
+                        }
+
+                        mAudioTrack.write(
+                                data,
+                                data.remaining(),
+                                AudioTrack.WRITE_BLOCKING
+                        );
+
 
                 long remainingFrames;
                 long totalFeeds;
@@ -264,21 +278,43 @@ public class FlutterPcmSoundPlugin implements
             } catch (InterruptedException ignored) {
             }
         }
-
-        mAudioTrack.stop();
-        mAudioTrack.flush();
-        mAudioTrack.release();
-        mAudioTrack = null;
     }
 
-    private void cleanup() {
-        mShouldCleanup = true;
-        if (playbackThread != null) {
-            playbackThread.interrupt();
-            playbackThread = null;
-        }
-        mDidSetup = false;
-    }
+            private void cleanup() {
+                mShouldCleanup = true;
+
+                // unblock queue
+                mSamples.offer(ByteBuffer.allocate(0));
+
+                if (playbackThread != null) {
+                    playbackThread.interrupt();
+                    try {
+                        playbackThread.join(500);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    playbackThread = null;
+                }
+
+                if (mAudioTrack != null) {
+                    try {
+                        mAudioTrack.pause();
+                        mAudioTrack.flush();
+                        mAudioTrack.stop();
+                    } catch (Exception ignored) {}
+                    mAudioTrack.release();
+                    mAudioTrack = null;
+                }
+
+                AudioManager audioManager =
+                        (AudioManager) applicationContext.getSystemService(Context.AUDIO_SERVICE);
+                audioManager.setMode(AudioManager.MODE_NORMAL);
+
+                mSamples.clear();
+                mDidSetup = false;
+            }
+
+
 
     private void invokeFeedCallback(long remainingFrames) {
         Map<String, Object> map = new HashMap<>();
